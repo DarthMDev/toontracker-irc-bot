@@ -1,0 +1,486 @@
+on *:CONNECT:{
+  if ($me != ToonTracker && $me != TestTracker) { nickchange }
+  .timer 1 10 .sockopen toonhq toonhq.org 80
+  ;Gives it 10 seconds before opening the socket to let it "breathe" as it gets assaulted 
+  ;with syncs and ping-pongs and notices from the IRC server
+}
+
+on *:DISCONNECT:{
+  .sockclose ttrapi
+}
+
+alias starttracking {
+  .sockopen toonhq toonhq.org 80
+}
+
+
+on *:sockopen:toonhq:{
+  unset %thq*
+  sockwrite -nt $sockname GET /api/v1/invasion/ HTTP/1.1
+  sockwrite -nt $sockname Host: toonhq.org
+  sockwrite -n $sockname User-Agent: ToonTracker/1.3.2
+  sockwrite -n $sockname Connection: keep-alive
+  sockwrite $sockname $crlf
+  .timer 1 5 .sockclose toonhq
+  .timer 1 9 .sockopen toonhq toonhq.org 80
+  ;The timers just reopen the socket to check again, it checks once every 9 seconds, which
+  ;then info can be pulled down in 1-2 seconds, making it a total time of 10-11 seconds between checks.
+}
+
+
+
+on *:sockread:toonhq:{
+  :top
+  sockread -f %thqread
+  ;switch f forces information into %thqread, even if it's just null or a $crlf (Carrier-Reed, Line Feed)
+  inc %thqcount 1
+  ;Counts the lines
+  if ($sockbr == 0) { goto bottom } 
+  ;If that's the end of the page, go to bottom
+  $iif(%thqread == $null, %thqread = -)
+  $iif(%thqread == $crlf, %thqread = -)
+  echo %thqread
+  if (%thqcount > 12) {
+    ;If it's above line 12 (where all the HTTP header info is given), then start reading the JSON
+    if (%thqread != -) { set %thqinv %thqinv $+ %thqread }
+    ;If there's more than one line (it can only read so many bytes at once), just add onto the variable)
+  }
+  goto top
+  :bottom
+  deterapi
+}
+
+alias -l deterapi {
+  if (%thqinv != - && %thqinv != $null && $chr(60) !isin %thqinv && $chr(62) !isin %thqinv && $chr(125) isin %thqinv) {
+    ;Makes sure we're not accidentally returning HTML, or accidentally returning a blank line
+    remini toonhq.ini Invasions 
+    remini toonhq.ini InvasionNumbers 
+    remini toonhq.ini startTime      
+    remini toonhq.ini InvasionEstimates
+    ;Removes all the information easily, to be rewritten again.
+    ;This does not trigger accidental "invasion ending" announcments because those are dependent on the districts located in the "district" item (toonhq.ini -> Information -> district -> "district 1, district 2, etc.")
+
+    writeini toonhq.ini Information lastUpdated $remove($wildtok(%thqinv,*last_updated*,1,44),last_updated,",:)
+    writeini toonhq.ini Information error $remove($wildtok(%thqinv,*error*,1,44),error,meta,",:,$chr(123))
+    writeini toonhq.ini Information serverStarted $remove($wildtok(%thqinv,*server_started*,1,44),server_started,meta,",:,$chr(125))
+    ;Write handy information down that's supplied by the API, such as the last update time, any errors that occured, and when the server started
+
+    if ($readini(toonhq.ini,Information,error) != null) {
+      if ($readini(toonhq.ini,Information,errorRecall) == $null) {
+        ;If an error did happen to occur, first we check if it hasn't already been announced (to avoid flooding), and if it hasn't, let "me" know.
+        query TheRandomDog An error occured in the Invasion API, it was logged as " $+ $readini(toonhq.ini,Information,error) $+ " $+ . 
+        writeini toonhq.ini Information errorRecall $readini(toonhq.ini,Information,error)
+      }
+      halt
+    }
+    else { remini toonhq.ini Information errorRecall }
+    ;If there is no error, make sure to remove the "recall" so it doesn't prevent an error from being reported next time.
+
+    if (*"invasions": []* iswm %thqinv) { 
+      ;Applies if there are no invasions, explaining the empty JSON section "[]"
+      writeini toonhq.ini Information totalInv 0
+      unset %thqinv 
+      if ($gettok($readini(toonhq.ini,Information,district),1,44) !isin %thqinv && $gettok($readini(toonhq.ini,Information,district),1,44) != $null) {
+        var %invcog = $readini(toonhq.ini,InvasionRecords,$replace($gettok($readini(toonhq.ini,Information,district),1,44),$chr(32),.))
+        ;%invcog returns the name of the cog
+        var %channels = $chan(0)
+        ;%channels returns the number of channels
+        unset % $+ [ $replace($gettok($readini(toonhq.ini,Information,district),1,44),$chr(32),.) ]
+        while (%channels) {
+          if ($chan(%channels) != #TwitchPlaysTTR && $chan(%channels) != #toonhqbeta && $chan(%channels) != #TTInfinite && $chan(%channels) != #ttiunmoderated) {
+            .timer 1 $calc(%channels / 10) msg $chan(%channels) Nice job, everyone! Looks like $iif(The isincs %invcog,$+ ,the) $iif(c isincs $chan(%channels).mode,$strip(%invcog,c),%invcog)  $+ $iif(c isincs $chan(%channels).mode,$null,) $+ invasion in $gettok($readini(toonhq.ini,Information,district),1,44) has ended! We sure showed them! :D
+          }
+          dec %channels
+        }
+        remini toonhq.ini InvasionRecords 
+        remini toonhq.ini Information district
+        remini toonhq.ini InvasionNumbers
+      }
+      ;The reason this is duplicated here as well as being at the bottom is because the bottom version will only trigger if there are invasions currently...
+      ;..since there aren't, the code inside won't trigger, meaning an announcment will never play that it ended.
+    }
+    else {
+      writeini toonhq.ini Information totalInv $wildtok(%thqinv,*/api/v1/invasion/*,0,32) 
+      ;All invasions mentioned have a specific API page on the website, so using that main link directory as a wildcard to see how many
+      ;invasions there are is a good tactic.
+      set %thqinv $deltok(%thqinv,$findtok(%thqinv,"meta":,1,32) $+ -,32)
+      set %thqinv $remove(%thqinv,$chr(123),$chr(125),$chr(91),$chr(93),"invasions":)
+      ;Removes the HTML header at the begging and the meta deta at the end, as well as [] and {} brackets
+      set %thqinv $replace(%thqinv,$chr(44),$chr(58),",$null)
+      ;Removes quotations and commas (We're removing this stuff to make it easier to read the JSON in the client)
+      set %thqinv $remove(%thqinv,as_of:,cog:,defeat_rate:,defeated:,district:,id:,manual:,reports:,resource_uri:,start_time:,total:)
+      ;Removes unneccessary information -- we know where all this is!
+      var %invasionwrite = $readini(toonhq.ini,Information,totalInv)
+      while (%invasionwrite > 0) {
+        if (Flunk isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 5 }
+        if (Pencil isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 5 }
+        if (Yesm isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 5 }
+        if (Micro isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 5 }
+        if (Downs isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 5 }
+        if (head isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 5 }
+        if (corporate isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 5 }
+        if (cheese isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 5 }
+        if (feeder isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 12 }
+        if (sucker isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 12 }
+        if (talker isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 12 }
+        if (chaser isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 12 }
+        if (stabber isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 12 }
+        if (doctor isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 12 }
+        if (eagle isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 12 }
+        if (wig isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 12 }
+        if (change isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 3 }
+        if (pincher isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 3 }
+        if (tightwad isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 3 }
+        if (counter isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 3 }
+        if (cruncher isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 3 }
+        if (money isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 3 }
+        if (shark isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 3 }
+        if (baron isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 3 }
+        if (caller isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 6 }
+        if (marketer isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 6 }
+        if (name isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 6 }
+        if (hander isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 6 }
+        if (shaker isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 6 }
+        if (face isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 6 }
+        if (mingler isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 6 }
+        if (hollywood isin $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58)) { var %color = 6 }
+        if (%color = 5) { var %type = Bossbot }
+        if (%color = 12) { var %type = Lawbot }
+        if (%color = 3) { var %type = Cashbot }
+        if (%color = 6) { var %type = Sellbot }
+        ;Big lot of spam here to determine what cog is invading
+
+        set %invdis $gettok($replace($gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 6),58),$chr(32),.),1-,46)
+        ;%invdis returns the invasion district in a one-word format... so instead of "Renaissance River", it would return "Renaissance.River".
+        ;This is to easily add it into the invasion file later, because if it was treated with a space, it would count the item as "Renaissance" and the value as "River."
+        writeini toonhq.ini Invasions %invdis %color $+ $replace($gettok($replace($remove($gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58),\u0003),$chr(32),.),1-,46),.,$chr(32))
+        writeini toonhq.ini InvasionRecords %invdis %color $+ $replace($gettok($replace($remove($gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58),\u0003),$chr(32),.),1-,46),.,$chr(32))
+        ;The InvasionRecords section is just to recall information about the invasion later after it's been removed -- for "ending announcments", among other things.
+        writeini toonhq.ini TypesAndLevels [ %invdis ] $+ .type %type
+        ;writeini toonhq.ini asOf %invdis $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 10),58)
+        ;writeini toonhq.ini defeateRate %invdis $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 8),58)
+        writeini toonhq.ini startTime %invdis $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 1),58)
+        writeini toonhq.ini InvasionNumbers %invdis $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 7),58) $+ / $+ $remove($gettok(%thqinv,$calc(%invasionwrite * 11),58),$chr(32))
+
+        var %cogsLeft = $calc($gettok($readini(toonhq.ini,InvasionNumbers,%invdis),2,47) - $gettok($readini(toonhq.ini,InvasionNumbers,%invdis),1,47))
+        var %totalSeconds = $calc(%cogsLeft / $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 8),58))
+        var %timeSince = $calc($ctime - $gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 10),58))
+        var %totalSeconds = $calc(%totalSeconds - %timeSince)
+        writeini toonhq.ini InvasionEstimates %invdis %totalSeconds
+        ;Estimates the total amount of time left in aan invasion
+        ;Kindly helped by LukeWarm74 who made http://toonhq.org/ and the toontownrewritten-android and toontownrewritten-ios projects. Check him out! :)
+
+        if ($replace(%invdis,.,$chr(32)) !isin $gettok($readini(toonhq.ini,Information,district),1- $+ $gettok($readini(toonhq.ini,Information,district),0,44),44)) {
+          ;If the invasion we just checked out ISN'T in the "districts" section, then the following occurs
+          writeini toonhq.ini Information district $addtok($readini(toonhq.ini,Information,district),$gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 6),58),44)
+          inc -c % $+ [ %invdis ]
+          var %channels = $chan(0)
+          while (%channels) {
+            if ($chan(%channels) != #TwitchPlaysTTR && $chan(%channels) != #toonhqbeta && $chan(%channels) != #TTInfinite && $chan(%channels) != #ttiunmoderated) {
+              .timer 1 $calc($calc(%channels / 10) + 5) msg $chan(%channels) Oh no! Looks like we're going to need your help, $chan(%channels) $+ ... $+ $iif(c isincs $chan(%channels).mode,$null,%color) $+ $iif($remove($gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58),\u0003) == Flunky,Flunkies,$iif($remove($gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58),\u0003) == Yesman,Yesmen,$remove($gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 9),58),\u0003) $+ s))  $+ $iif(c isincs $chan(%channels).mode,$null,) $+ have taken over $replace($gettok(%thqinv,$calc($calc(%invasionwrite * 11) - 6),58),.,$chr(32)) $+ !
+            }
+            dec %channels
+          }
+        }
+        dec %invasionwrite
+      }
+      ;This is the regular "invasion removal" system -- it occurs when there's more than one invasion, and just removes that district
+      ;from the districts section and announces the invasion ended.
+      var %announcment = $gettok($readini(toonhq.ini,Information,district),0,44)
+      while (%announcment) {
+        if ($gettok($readini(toonhq.ini,Information,district),%announcment,44) !isin %thqinv) {
+          var %invcog = $readini(toonhq.ini,InvasionRecords,$gettok($replace($gettok($readini(toonhq.ini,Information,district),%announcment,44),$chr(32),.),1-,46))
+          unset % $+ [ $gettok($readini(toonhq.ini,Information,district),1,44) ]
+          var %channels = $chan(0)
+          while (%channels) {
+            if ($chan(%channels) != #TwitchPlaysTTR && $chan(%channels) != #toonhqbeta && $chan(%channels) != #TTInfinite && $chan(%channels) != #ttiunmoderated) {
+              .timer 1 $calc(%channels / 10) msg $chan(%channels) Nice job, everyone! Looks like $iif(The isincs %invcog,$+ ,the) $iif(c isincs $chan(%channels).mode,$strip(%invcog,c),%invcog)  $+ $iif(c isincs $chan(%channels).mode,$null,) $+ invasion in $gettok($readini(toonhq.ini,Information,district),1,44) has ended! We sure showed them! :D
+            }
+            dec %channels
+
+          }
+          writeini toonhq.ini Information district $remtok($readini(toonhq.ini,Information,district),$gettok($readini(toonhq.ini,Information,district),%announcment,44),1,44))
+          remini toonhq.ini InvasionRecords $replace($gettok($readini(toonhq.ini,Information,district),%announcment,44),$chr(32),.)
+        }
+        dec %announcment
+      }
+    }
+  }
+}
+
+
+alias cogslist {
+  return $iif($hget(InvasionCount,$1) != $null,$iif(and isin $hget(InvasionCount,$$1),and $calc($gettok($readini(toonhq.ini,InvasionNumbers,$replace($hget(InvasionCount,$$1),$chr(32) $+ ,.,and.,$null,$chr(44),$null)),2,47) - $gettok($readini(toonhq.ini,InvasionNumbers,$replace($hget(InvasionCount,$$1),$chr(32) $+ ,.,and.,$null,$chr(44),$null)),1,47)) $readini(toonhq.ini,Invasions,$replace($hget(InvasionCount,$$1),$chr(32) $+ ,.,and.,$null,$chr(44),$null)) $+ s ( $+ $int($calc($readini(toonhq.ini,InvasionEstimates,$replace($hget(InvasionCount,$$1),$chr(32) $+ ,.,and.,$null,$chr(44),$null)) / 60)) $+ m) $+ ,$calc($gettok($readini(toonhq.ini,InvasionNumbers,$replace($hget(InvasionCount,$$1),$chr(32) $+ ,.,$chr(44),$null)),2,47) - $gettok($readini(toonhq.ini,InvasionNumbers,$replace($hget(InvasionCount,$$1),$chr(32) $+ ,.,$chr(44),$null)),1,47)) $readini(toonhq.ini,Invasions,$replace($hget(InvasionCount,$$1),$chr(32) $+ ,.,$chr(44),$null)) $+ s ( $+ $int($calc($readini(toonhq.ini,InvasionEstimates,$replace($hget(InvasionCount,$$1),$chr(32) $+ ,.,and.,$null,$chr(44),$null)) / 60)) $+ m) $+ $iif($hget(InvasionCount,$$1) != $null,$chr(44),$null)),$null) 
+}
+;cogslist is a custom identifier [ aka $cogslist() ] which is used to easily return cog information for any district
+;Usally pulled by $cogslist($hget(InvasionCount,1)), or the like, it gives you the respective district that was listed in 3 or more invasions (see below)
+
+
+on *:TEXT:*inv*:#:{ 
+  ;THIS is where we respond to people's requests!
+
+  if (~invasions == $1 && TTRServerBot ison $chan) { halt }
+  ;If Harv's TTRServerBot is in the channel, we don't want duplicate messages D:
+  if (%tutorial == 1 || $chan == #ttinfinite || $chan == #ttiunmoderated) { halt }
+  ;If this bot is being introduced to a new channel for the first time, or it's a TTI channel (which wouldn't apply to TTR invasions, of course!), don't respond.
+  if ($nick == ChanServ) { halt }
+  ;Sometimes people like to set something that would trigger ToonTracker as their "!setinfo", or greeting message. If that happens, we'll just ignore it.
+  if (%update != 1 || %update != 2 || %update != 4) {
+    unset %inv*
+    set %invmsg $1-
+    set %invnick $nick 
+  }
+  ;Finally, if there isn't an update, we'll set 2 handy variables... %invmsg (which stores the message), and %invnick (which stores their nick).
+
+  ;DETERMINE THE COG
+  if (What isin %invmsg && inv isin %invmsg && (at isin %invmsg || in isin %invmsg)) { var %t = reqdistrict | goto deterdist }
+  ;Triggers on "What type of invasion is in [district]?"
+  if (is isin %invmsg && there isin %invmsg && inv isin %invmsg && (at isin %invmsg || in isin %invmsg)) { var %t = reqdistrict | goto deterdist }
+  ;Triggers on "Is there a [cog] invasion anywhere?"
+  :BOSSBOTS
+  if (Flunky isin %invmsg || Flunkies isin %invmsg) { if (V2 isin %invmsg) { set %invcog 5Flunky V2.0 } | else { set %invcog 5Flunky } | set %invtype 5Bossbot | set %invlvl Low | goto checksystem1 }
+  if (Pencil isin %invmsg || Pusher isin %invmsg) { if (V2 isin %invmsg) { set %invcog 5Pencil Pusher V2.0 } | else { set %invcog 5Pencil Pusher } | set %invtype 5Bossbot | set %invlvl Low | goto checksystem1 }
+  if (Yesman isin %invmsg || Yesmen isin %invmsg) { if (V2 isin %invmsg) { set %invcog 5Yesman V2.0 } | else { set %invcog 5Yesman } | set %invtype 5Bossbot | set %invlvl Medium | goto checksystem1 }
+  if (Micro isin %invmsg || manager isin %invmsg) { if (V2 isin %invmsg) { set %invcog 5Micromanager V2.0 } | else { set %invcog 5Micromanager } | set %invtype 5Bossbot | set %invlvl Medium | goto checksystem1 }
+  if (Downsizer isin %invmsg) { if (V2 isin %invmsg) { set %invcog 5Downsizer V2.0 } | else { set %invcog 5Downsizer } | set %invtype 5Bossbot | set %invlvl Medium | goto checksystem1 }
+  if (hunter isin %invmsg) { if (V2 isin %invmsg) { set %invcog 5Head Hunter V2.0 } | else { set %invcog 5Head Hunter } | set %invtype 5Bossbot | set %invlvl High | goto checksystem1 }
+  if (Raider isin %invmsg || Corporate isin %invmsg) { if (V2 isin %invmsg) { set %invcog 5Corporate Raider V2.0 } | else { set %invcog 5Corporate Raider } | set %invtype 5Bossbot | set %invlvl High | goto checksystem1 }
+  if (Big Cheese isin %invmsg || Cheese isin %invmsg) { if (V2 isin %invmsg) { set %invcog 5Big Cheese V2.0 } | else { set %invcog 5The Big Cheese } | set %invtype 5Bossbot | set %invlvl High | goto checksystem1 }
+  :LAWBOTS
+  if (Feeder isin %invmsg) { if (V2 isin %invmsg) { set %invcog 12Bottom Feeder V2.0 } | else { set %invcog 12Bottom Feeder } | set %invtype 12Lawbot | set %invlvl Low | goto checksystem1 }
+  if (Bloodsucker isin %invmsg) { if (V2 isin %invmsg) { set %invcog 12Bloodsucker V2.0 } | else { set %invcog 12Bloodsucker } | set %invtype 12Lawbot | set %invlvl Low | goto checksystem1 }
+  if (Talker isin %invmsg) { if (V2 isin %invmsg) { set %invcog 12Double Talker V2.0 } | else { set %invcog 12Double Talker } | set %invtype 12Lawbot | set %invlvl Medium | goto checksystem1 }
+  if (Ambulance isin %invmsg || Chaser isin %invmsg) { if (V2 isin %invmsg) { set %invcog 12Ambulance Chaser V2.0 } | else { set %invcog 12Ambulance Chaser } | set %invtype 12Lawbot | set %invlvl Medium | goto checksystem1 }
+  if (stabber isin %invmsg) { if (V2 isin %invmsg) { set %invcog 12Backstabber V2.0 } | else { set %invcog 12Back Stabber } | set %invtype 12Lawbot | set %invlvl Medium | goto checksystem1 }
+  if (Spin isin %invmsg || Doctor isin %invmsg) { if (V2 isin %invmsg) { set %invcog 12Spin Doctor V2.0 } | else { set %invcog 12Spin Doctor } | set %invtype 12Lawbot | set %invlvl High | goto checksystem1 }
+  if (Legal isin %invmsg || Eagle isin %invmsg) { if (V2 isin %invmsg) { set %invcog 12Legal Eagle V2.0 } | else { set %invcog 12Legal Eagle } | set %invtype 12Lawbot | set %invlvl High | goto checksystem1 }
+  if (Big Wig isin %invmsg || Wig isin %invmsg) { if (V2 isin %invmsg) { set %invcog 12Big Wig V2.0 } | else { set %invcog 12Big Wig } | set %invtype 12Lawbot | set %invlvl High | goto checksystem1 }
+  :CASHBOTS
+  if (Short isin %invmsg || Change isin %invmsg) { if (V2 isin %invmsg) { set %invcog 3Short Change V2.0 } | else { set %invcog 3Short Change } | set %invtype 3Cashbot | set %invlvl Low | goto checksystem1 }
+  if (Penny isin %invmsg || Pincher isin %invmsg) { if (V2 isin %invmsg) { set %invcog 3Penny Pincher V2.0 } | else { set %invcog 3Penny Pincher } | set %invtype 3Cashbot | set %invlvl Low | goto checksystem1 }
+  if (Tightwad isin %invmsg) { if (V2 isin %invmsg) { set %invcog 3Tightwad V2.0 } | else { set %invcog 3Tightwad } | set %invtype 3Cashbot | set %invlvl Medium | goto checksystem1 }
+  if (Counter isin %invmsg) { if (V2 isin %invmsg) { set %invcog 3Bean Counter V2.0 } | else { set %invcog 3Bean Counter } | set %invtype 3Cashbot | set %invlvl Medium | goto checksystem1 }
+  if (Cruncher isin %invmsg) { if (V2 isin %invmsg) { set %invcog 3Number Cruncher V2.0 } | else { set %invcog 3Number Cruncher } | set %invtype 3Cashbot | set %invlvl Medium | goto checksystem1 }
+  if (Bag isin %invmsg) { if (V2 isin %invmsg) { set %invcog 3Money Bag V2.0 } | else { set %invcog 3Money Bag } | set %invtype 3Cashbot | set %invlvl High | goto checksystem1 }
+  if (Loan isin %invmsg || Shark isin %invmsg) { if (V2 isin %invmsg) { set %invcog 3Loan Shark V2.0 } | else { set %invcog 3Loan Shark } | set %invtype 3Cashbot | set %invlvl High | goto checksystem1 }
+  if (Robber isin %invmsg || Baron isin %invmsg) { if (V2 isin %invmsg) { set %invcog 3Robber Baron V2.0 } | else { set %invcog 3Robber Baron } | set %invtype 3Cashbot | set %invlvl High | goto checksystem1 }
+  :SELLBOTS
+  if (Cold isin %invmsg || Caller isin %invmsg) { if (V2 isin %invmsg) { set %invcog 6Cold Caller V2.0 } | else { set %invcog 6Cold Caller } | set %invtype 6Sellbot | set %invlvl Low | goto checksystem1 }
+  if (marketer isin %invmsg) { if (V2 isin %invmsg) { set %invcog 6Telemarketer V2.0 } | else { set %invcog 6Telemarketer } | set %invtype 6Sellbot | set %invlvl Low | goto checksystem1 }
+  if (Dropper isin %invmsg) { if (V2 isin %invmsg) { set %invcog 6Name Dropper V2.0 } | else { set %invcog 6Name Dropper } | set %invtype 6Sellbot | set %invlvl Medium | goto checksystem1 }
+  if (Hander isin %invmsg) { if (V2 isin %invmsg) { set %invcog 6Glad Hander V2.0 } | else { set %invcog 6Glad Hander } | set %invtype 6Sellbot | set %invlvl Medium | goto checksystem1 }
+  if (Mover isin %invmsg || Shaker isin %invmsg) { if (V2 isin %invmsg) { set %invcog 6Mover & Shaker V2.0 } | else { set %invcog 6Mover & Shaker } | set %invtype 6Sellbot | set %invlvl Medium | goto checksystem1 }
+  if (Two-Face isin %invmsg || (Two isin %invmsg && Face isin %invmsg)) { if (V2 isin %invmsg) { set %invcog 6Two-Face V2.0 } | else { set %invcog 6Two-Face } | set %invtype 6Sellbot | set %invlvl High | goto checksystem1 }
+  if (Mingler isin %invmsg) { if (V2 isin %invmsg) { set %invcog 6Mingler V2.0 } | else { set %invcog 6The Mingler } | set %invtype 6Sellbot | set %invlvl High | goto checksystem1 }
+  if ((Mr isin %invmsg && Hollywood isin %invmsg) || Hollywood isin %invmsg) { if (V2 isin %invmsg) { set %invcog 6Mr. Hollywood V2.0 } | else { set %invcog 6Mr. Hollywood } | set %invtype 6Sellbot | set %invlvl High | goto checksystem1 }
+  :TYPESandLEVELS
+  if (low isin %invmsg && any isin %invmsg) { set %invlvl Low | var %t = typelevel | goto echoinv }
+  if (Med isin %invmsg && any isin %invmsg) { set %invlvl Medium | var %t = typelevel | goto echoinv }
+  if (Hi isin %invmsg && any isin %invmsg) { set %invlvl High | var %t = typelevel | goto echoinv }
+  if (Boss isin %invmsg && any isin %invmsg) { set %invtype 5Bossbot | var %t = typelevel | goto echoinv }
+  if (Law isin %invmsg && any isin %invmsg) { set %invtype 12Lawbot | var %t = typelevel | goto echoinv }
+  if (Cash isin %invmsg && any isin %invmsg) { set %invtype 3Cashbot | var %t = typelevel | goto echoinv }
+  if (Sell isin %invmsg && any isin %invmsg) { set %invtype 6Sellbot | var %t = typelevel | goto echoinv }
+  ;Gets a HUGE LOAD of information for every cog, level, or type of cog that could be mentioned
+  :QUESTION
+  if (%update == 1) { .notice $nick Sorry, invasion tracker is down currently. | halt }
+  if (%update == 2) { .notice $nick What do you mean? The game is down! | halt }
+  if ((any isin %invmsg && inv isin %invmsg && $len(%invmsg) < 15) || (any isin %invmsg && inva isin %invmsg && ? isin %invmsg) || (inv isin %invmsg && $len(%invmsg) < 11) || (invasion isin %invmsg && ? isin %invmsg && $len(%invmsg) < 11)) {
+    ;The main request. If someone says "Any invasions?", "invasions", "inv", etc., this pulls information from every invasion logged
+    if ($readini(toonhq.ini,Information,totalInv) == 1) {
+      ;IF there's only 1 invasion...
+      var %invcog = $iif($readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,1)) == 5Flunky,5Flunkies,$iif($readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,1)) == 5Yesman,5Yesmen,$readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,1)) $+ s))
+      ;Marks the cog as a temporary variable, which is helpful when checking for plural.
+      ;In the future, this might be it's own identifier such as $cogplural()
+      msg $chan There's about $calc($gettok($readini(toonhq.ini,InvasionNumbers,$ini(toonhq.ini,InvasionNumbers,1)),2,47) - $gettok($readini(toonhq.ini,InvasionNumbers,$ini(toonhq.ini,InvasionNumbers,1)),1,47)) $iif(c isincs $chan($chan).mode,$strip(%invcog,c),%invcog) $iif(c isincs $chan($chan).mode,$null,) $+ invading $replace($ini(toonhq.ini,Invasions,1) $+ , ., $chr(32) $+ ) $+ , %invnick $+ ! It'll end in about $int($calc($readini(toonhq.ini,InvasionEstimates,$ini(toonhq.ini,InvasionEstimates,1)) / 60)) minute $+ $iif($int($calc($readini(toonhq.ini,InvasionEstimates,$ini(toonhq.ini,InvasionEstimates,1)) / 60)) != 1,s,$null) $+ , so go bust some baddies! :D 
+      ;Messages the channel the amount of cogs remaining, the cog (with the color of the text being their respective "cog type color"), the district, and an estimated time remaining in a friendly, easy-to-read format.
+      unset %inv*
+      halt
+    }
+    if ($readini(toonhq.ini,Information,totalInv) == 2) {
+      ;IF there's 2 invasions...
+      var %disinv1 = $ini(toonhq.ini,Invasions,1)
+      var %disinv2 = $ini(toonhq.ini,Invasions,2)
+      var %discog1 = $iif($readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,1)) == 5Flunky,5Flunkies,$iif($readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,1)) == 5Yesman,5Yesmen,$readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,1)) $+ s)) 
+      var %discog2 = $iif($readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,2)) == 5Flunky,5Flunkies,$iif($readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,2)) == 5Yesman,5Yesmen,$readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,2)) $+ s)) 
+      ;Sets the two invasion districts (this can be specific, since there's only two), and then the proper plurals from each cog type invading the districts.
+      msg $chan There are currently invasions going on in  $+ $replace(%disinv1, ., $chr(32) $+) $+  ( $+ $calc($gettok($readini(toonhq.ini,InvasionNumbers,%disinv1),2,47) - $gettok($readini(toonhq.ini,InvasionNumbers,%disinv1),1,47)) $iif(c isincs $chan($chan).mode,$strip(%discog1,c),%discog1) $+ $iif(c isincs $chan($chan).mode,$null,) for $int($calc($readini(toonhq.ini,InvasionEstimates,%disinv1) / 60)) $+ m) and  $+ $replace(%disinv2, ., $chr(32) $+) $+  ( $+ $calc($gettok($readini(toonhq.ini,InvasionNumbers,%disinv2),2,47) - $gettok($readini(toonhq.ini,InvasionNumbers,%disinv2),1,47)) $iif(c isincs $chan($chan).mode,$strip(%discog2,c),%discog2) $+ $iif(c isincs $chan($chan).mode,$null,) for $int($calc($readini(toonhq.ini,InvasionEstimates,%disinv2) / 60)) $+ m) $+ , %invnick $+ ! Take your pick! :) 
+      ;Messages the channel the amount of cogs remaining, the cogs (with the color of the text being their respective "cog type colors"), the districts, and the estimated time remaining for both in a friendly, easy-to-read format.
+      unset %inv*
+      if ($hget(InvasionCount) != $null) { hfree InvasionCount }
+      halt
+    }
+    if ($readini(toonhq.ini,Information,totalInv) > 2) {
+      ;IF there's more than 2 invasions...
+      hmake InvasionCount 10
+      ;We use hash tables to temporarily store the district data
+      var %invcount = $ini(toonhq.ini,Invasions,0)
+      var %invcountMax = $ini(toonhq.ini,Invasions,0)
+      while (%invcount) {
+        if (%invcount == %invcountMax) { hadd InvasionCount invoff $+ %invcount and $replace($ini(toonhq.ini,Invasions,%invcount), ., $chr(32)) $+ , }
+        ;If it's the "last" district being listed, we need proper grammar, so we include an "and" in the item. (e.g. and Vibrant Valley,)
+        else { hadd InvasionCount invoff $+ %invcount $replace($ini(toonhq.ini,Invasions,%invcount), ., $chr(32)) $+ , }
+        ;Otherwise, we just list the district name. (e.g. Bliss Bayou,)
+        dec %invcount
+      }
+      msg $chan There are currently invasions going on in  $+ $hget(InvasionCount,invoff1) $hget(InvasionCount,invoff2) $hget(InvasionCount,invoff3) $hget(InvasionCount,invoff4) $hget(InvasionCount,invoff5) $hget(InvasionCount,invoff6) $hget(InvasionCount,invoff7) $hget(InvasionCount,invoff8) $hget(InvasionCount,invoff9) $hget(InvasionCount,invoff10) $hget(InvasionCount,invoff11) $hget(InvasionCount,invoff12) $hget(InvasionCount,invoff13) $hget(InvasionCount,invoff14) $hget(InvasionCount,invoff15) $hget(InvasionCount,invoff16) $hget(InvasionCount,invoff17) $hget(InvasionCount,invoff18) $hget(InvasionCount,invoff19) $hget(InvasionCount,invoff20)  $+ %invnick $+ ! There's a lot to choose from! :) 
+      msg $chan Those being $+ $iif(c isincs $chan($chan).mode,$null,) $iif(c isincs $chan($chan).mode,$remove($replace($cogslist(invoff1) $cogslist(invoff2) $cogslist(invoff3) $cogslist(invoff4) $cogslist(invoff5) $cogslist(invoff6) $cogslist(invoff7) $cogslist(invoff8) $cogslist(invoff9) $cogslist(invoff10) $cogslist(invoff11) $cogslist(invoff12) $cogslist(invoff13) $cogslist(invoff14) $cogslist(invoff15) $cogslist(invoff16) $cogslist(invoff17) $cogslist(invoff18) $cogslist(invoff19) $cogslist(invoff20),Yesmans,Yesmen,Flunkys,Flunkies),12,3,6,5,14,),$replace($cogslist(invoff1) $cogslist(invoff2) $cogslist(invoff3) $cogslist(invoff4) $cogslist(invoff5) $cogslist(invoff6) $cogslist(invoff7) $cogslist(invoff8) $cogslist(invoff9) $cogslist(invoff10) $cogslist(invoff11) $cogslist(invoff12) $cogslist(invoff13) $cogslist(invoff14) $cogslist(invoff15) $cogslist(invoff16) $cogslist(invoff17) $cogslist(invoff18) $cogslist(invoff19) $cogslist(invoff20),Yesmans,Yesmen,Flunkys,Flunkies)) respectively. 
+      ;To prevent a bunch of information being stored into one message, we send two... one lists all the districts names...
+      ;..while the other uses $cogslist() to get the information and proper plurals for each district mentioned in the hash table.
+      unset %inv*
+      hfree InvasionCount
+      halt
+    }
+    if ($readini(toonhq.ini,Information,totalInv) == 0) { msg $chan Sorry %invnick $+ , I don't see any invasions happening! :( }
+    ;If there aren't any invasions, then we'll apologize to the user because it's totally our fault. ;)
+    unset %inv*
+    halt
+  }
+  :checksystem1
+  if (%update == 1 || %update == 2 || %update == 4) { halt }
+  ;This message is here again because we still don't want invasion commands to be entered, but we don't want it to do anything either if the "main request" isn't requested.  
+  if ((is isin %invmsg && a isin %invmsg && inva isin %invmsg && where isin %invmsg) || (any isin %invmsg && inv isin %invmsg) || (any isin %invmsg && inva isin %invmsg && ? isin %invmsg) || (is isin %invmsg && there isin %invmsg && a isin %invmsg && %invcog)) { var %t = reqcurrentinv | goto echoinv }
+  ;This triggers on "Any [cog] invasions?"
+  if ((long isin %invmsg && ? isin %invmsg && %invcog) || (long isin %invmsg && ? isin %invmsg && (been isin %invmsg || ago isin %invmsg))) { var %t = reqinvtime | goto echoinv }
+  ;This triggers on "How long has the [cog/district] invasion been going on?"
+
+
+  ;CHECK IF THE COG IS NOT A FLUKE KEYWORD
+  ;This is the handy dandy word checker! It makes sure that it doesn't misinterpret a word. For example... without using this, "heading" might be interpreted as "head hunter"
+  var %wordchecker = $0
+  var %wordcheckerperm = %wordchecker
+  tokenize 32 $remove(%invcog,,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
+  ;Tokenizes the %invcog variable (the cog name) by $chr(32), or the space, as well as removing any color codes in it.
+  while (%wordchecker > 0) {
+    if ($3) {
+      if ($3 == $gettok(%invmsg,%wordchecker,32) || $3 $+ s == $gettok(%invmsg,%wordchecker,32) $+ ) {
+        var %goahead = cogconfirmed
+      }
+    }
+    if ($2) {
+      if ($2 == $gettok(%invmsg,%wordchecker,32) || $2 $+ s == $gettok(%invmsg,%wordchecker,32) $+ ) {
+        var %goahead = cogconfirmed
+      }
+    }
+    if ($1 == $gettok(%invmsg,%wordchecker,32) || $1 $+ s == $gettok(%invmsg,%wordchecker,32) $+ ) {
+      var %goahead = cogconfirmed
+    }
+    if ($1 == 5Flunky && (Flunkies == $gettok(%invmsg,%wordchecker,32) || Flunky == $gettok(%invmsg,%wordchecker,32) $+ ) $+ ) {
+      var %goahead = cogconfirmed
+    }
+    if ($1 == 5Yesman && (Yesmen == $gettok(%invmsg,%wordchecker,32) || Yesman == $gettok(%invmsg,%wordchecker,32) $+ ) $+ ) {
+      var %goahead = cogconfirmed
+      dec %wordchecker
+    }
+    if (!%goahead) { 
+      unset %inv* 
+      if (rip !isin %invmsg && end !isin %invmsg && over !isin %invmsg && done !isin %invmsg && remove !isin %invmsg) { halt }
+      ;If the cog name didn't check out, AND we're not reporting an invasion has ended, then stop.
+    }
+  }
+
+  ;DETERMINE THE DISTRICT
+  ;Another handy dandy word checker -- this one checks districts
+  :deterdist
+  var %search = $ini(toonhq.ini,DistrictNames,0)
+  while (%search > 0) {
+    if (* $ini(toonhq.ini,DistrictNames, $+ %search $+ ) * iswm %invmsg || * $+ $ini(toonhq.ini,DistrictNames, $+ %search $+ ) * iswm %invmsg || * $ini(toonhq.ini,DistrictNames, $+ %search $+ ) $+ * iswm %invmsg) { 
+      set %invdis $replace( $+ $readini(toonhq.ini,DistrictNames, $+ $ini(toonhq.ini,DistrictNames, $+ %search $+ ) $+ ), $chr(32) $+ , .)
+      if ($readini(toonhq.ini,Invasions, $+ $ini(toonhq.ini,Invasions, $+ %invdis $+ ) $+ ) == %invcog) { set %abr $readini(toonhq.ini,Invasions, $+ $ini(toonhq.ini,Invasions, $+ %invdis $+ ) $+ ) }
+    }
+    dec %search
+  }
+
+
+  ;CHECK IF THE DISTRICT IS NOT A FLUKE WORD
+  ;if (%invdis != $null) { tokenize 46 %invdis }
+  ;else { goto skipflukecheck }
+  ;var %wordchecker = %wordcheckerperm
+  ;while (%wordchecker) {
+  ;  if ($2) {
+  ;    if ($2 == $gettok(%invmsg,%wordchecker,32) $+ ) {
+  ;      var %goahead = districtconfirmed
+  ;    }
+  ;  }
+  ;  if ($1 == $gettok(%invmsg,%wordchecker,32) $+ ) {
+  ;    var %goahead = districtconfirmed 
+  ;  }
+  ;  if ($left( $+ $1 $+ ,1) $+ $left( $+ $2 $+ ,1) == $gettok(%invmsg,%wordchecker,32) $+ ) {
+  ;    var %goahead = districtconfirmed
+  ;  }
+  ;  dec %wordchecker
+  ;}
+  ;if (%t == reqdistrict) { goto echoinv }
+  ;if (%goahead != districtconfirmed) { unset %goahead | unset %inv* }
+
+
+  ;CHECK IF THE REMOVAL KEYWORD IS NOT A FLUKE WORD
+  ;This tended to check if we meant to remove a cog invasion -- but this doesn't apply anymore due to the fact invasions run off the API, not user-submitted information.
+  ;This will probably get revamped during public release, when cog-summoned invasions begin to not be reported by the API.
+  :skipflukecheck
+  var %wordchecker = %wordcheckerperm
+  if (rip !isin %invmsg && end !isin %invmsg && over !isin %invmsg && done !isin %invmsg && remove !isin %invmsg) { goto echoinv }
+  if (%invcog || %invdis) { 
+    while (%wordchecker) {
+      if (rip == $gettok(%invmsg,%wordchecker,32) $+ ) {
+        set %goahead removal
+      }
+      if (end == $gettok(%invmsg,%wordchecker,32) || ended == $gettok(%invmsg,%wordchecker,32) $+ ) {
+        set %goahead removal
+      }
+      if (done == $gettok(%invmsg,%wordchecker,32) $+ ) {
+        set %goahead removal
+      }
+      if (over == $gettok(%invmsg,%wordchecker,32) $+ ) {
+        set %goahead removal
+      }
+      if (remove == $gettok(%invmsg,%wordchecker,32) $+ ) {
+        set %goahead removal
+      }
+      if (no == $gettok(%invmsg,%wordchecker,32) $+ ) {
+        set %goahead removal
+      }
+      if (finished == $gettok(%invmsg,%wordchecker,32) $+ ) {
+        set %goahead removal
+      }
+      dec %wordchecker
+    }
+  }
+  set %wordchecker %wordcheckerperm
+
+
+  ;FIND THE APPROPRIATE REQUEST AND RELAY THE INFORMATION
+  :echoinv
+  ;RECALL THE INVASION IN A CERTAIN DISTRICT
+  ;If someone asked what invasion was going on in, say Bliss Bayou, it would check Bliss Bayou and report the information.
+  if (%t == reqdistrict) {
+    if ( $+ $readini(toonhq.ini,Invasions, $+ %invdis $+ ) != $null) { 
+      var %invcog = $iif($readini(toonhq.ini,Invasions,%invdis) == 5Flunky,5Flunkies,$iif($readini(toonhq.ini,Invasions,%invdis) == 5Yesman,5Yesmen,$readini(toonhq.ini,Invasions,%invdis) $+ s))
+      msg $chan There's about $calc($gettok($readini(toonhq.ini,InvasionNumbers,%invdis),2,47) - $gettok($readini(toonhq.ini,InvasionNumbers,%invdis),1,47)) $iif(c isincs $chan($chan).mode,$strip(%invcog,c),%invcog) $iif(c isincs $chan($chan).mode,$null,) $+ invading $replace(%invdis $+ , ., $chr(32) $+ ) $+ , %invnick $+ ! Go get 'em! :D
+    }
+    else { msg $chan I don't see an invasion in  $+ $replace(%invdis,.,$chr(32)) $+ , $nick $+ ... are you trying to confuse me? }
+  }
+  ;RECALL IF THERE'S A REQUESTED COG INVASION
+  if (%t == reqcurrentinv) {
+    if (!%invcog) { goto nocog }
+    var %invcount = $ini(toonhq.ini,Invasions,0)
+    while (%invcount) {
+      if ($readini(toonhq.ini,Invasions,$ini(toonhq.ini,Invasions,%invcount)) == %invcog) {
+        msg $chan Yes %invnick $+ , there's a %invcog invasion in $replace( $+ $ini(toonhq.ini,Invasions, $+ %invcount $+ ) $+ , ., $chr(32) $+ ) $+ ! Go get 'em! :D
+        var %abn = 1
+      }
+      dec %invcount
+    }
+    if (!%abn) { msg $chan I don't see any %invcog invasions, %invnick $+ . Sorry. :( } 
+    :nocog
+    unset %inv*
+    unset %goahead
+    halt
+  }
+  :error
+  if ($error) {
+    set %error $+ [ $ctime ] $error
+    if (hinc !isin $error) { msg $chan Error was found, gave it the ID of  $+ $ctime $+ . TheRandomDog! }
+    reseterror
+  }
+}
